@@ -1,55 +1,54 @@
 import numpy
 from tqdm import tqdm
 from sklearn.decomposition import MiniBatchDictionaryLearning, SparseCoder
-from skimage.measure import compare_ssim
+from skimage.metrics import structural_similarity
 from sklearn.metrics import average_precision_score, roc_auc_score
 import pickle
 import os
 import matplotlib.pyplot as plt
 import cv2
+import random
 
 
 class SparseCodingWithMultiDict(object):
     def __init__(
         self,
         preprocesses,
-        num_of_basis,
-        alpha,
-        transform_algorithm,
-        transform_alpha,
-        fit_algorithm,
-        n_iter,
-        num_of_nonzero,
+        model_env,
         train_loader=None,
         test_neg_loader=None,
         test_pos_loader=None,
-        use_ssim=False,
     ):
+
         self.preprocesses = preprocesses
 
-        self.num_of_basis = num_of_basis
-        self.alpha = alpha
-        self.transform_algorithm = transform_algorithm
-        self.transform_alpha = transform_alpha
-        self.fit_algorithm = fit_algorithm
-        self.n_iter = n_iter
-        self.num_of_nonzero = num_of_nonzero
+        self.num_of_basis = model_env["num_of_basis"]
+        self.alpha = model_env["alpha"]
+        self.transform_algorithm = model_env["transform_algorithm"]
+        self.transform_alpha = model_env["transform_alpha"]
+        self.fit_algorithm = model_env["fit_algorithm"]
+        self.n_iter = model_env["n_iter"]
+        self.num_of_nonzero = model_env["num_of_nonzero"]
+        self.use_ssim = model_env["use_ssim"]
+
+        self.cutoff_edge_width = model_env["cutoff_edge_width"]
+        self.patch_size = model_env["patch_size"]
+        self.stride = model_env["stride"]
+        self.num_of_ch = model_env["num_of_ch"]
+        self.output_npy = model_env["output_npy"]
+
+        self.org_l = int(256 / 8.0) - self.cutoff_edge_width * 2
 
         self.train_loader = train_loader
         self.test_neg_loader = test_neg_loader
         self.test_pos_loader = test_pos_loader
 
-        self.use_ssim = use_ssim
-
-        self.Mu = None
-        self.Sigma = None
         self.dictionaries = None
-        self.dict_order = range(896)
 
     def train(self):
         arrs = []
         for batch_data in self.train_loader:
-            batch_img = batch_data[1]
+            batch_img = batch_data[2]
             for p in self.preprocesses:
                 batch_img = p(batch_img)
             N, P, C, H, W = batch_img.shape
@@ -67,38 +66,11 @@ class SparseCodingWithMultiDict(object):
                 fit_algorithm=self.fit_algorithm,
                 n_iter=self.n_iter,
             )
-            .fit(train_arr[i])
+            .fit(train_arr[:, i, :])
             .components_
             for i in tqdm(range(C), desc="learning dictionary")
         ]
-        self.calc_dict_order()
         print("learned.")
-
-    def calc_dict_order(self):
-        self.dict_order = [0]
-        picked_set = set()
-        prev = self.dictionaries[0]
-        picked_set.add(0)
-        for i in range(len(self.dictionaries) - 1):
-            max_id = 0
-            max_val = -1
-            for j in range(len(self.dictionaries)):
-                if j in picked_set:
-                    continue
-                else:
-                    val = self.calc_diff(prev, self.dictionaries[j])
-                    if val > max_val:
-                        max_id = j
-                        max_val = val
-            self.dict_order.append(max_id)
-            prev = self.dictionaries[max_id]
-            picked_set.add(max_id)
-
-    def calc_diff(self, dict1, dict2):
-        ret = 0
-        for i in range(len(dict1)):
-            ret += min(numpy.sum((dict1[i] - dict2[i]) ** 2), numpy.sum((dict1[i] + dict2[i]) ** 2))
-        return ret
 
     def save_dict(self, file_path):
         with open(file_path, "wb") as f:
@@ -108,7 +80,7 @@ class SparseCodingWithMultiDict(object):
         with open(file_path, "rb") as f:
             self.dictionaries = pickle.load(f)
 
-    def test(self, org_H, org_W, patch_size, stride, num_of_ch):
+    def test(self):
         C = len(self.dictionaries)
         coders = [
             SparseCoder(
@@ -119,119 +91,135 @@ class SparseCodingWithMultiDict(object):
             for i in range(C)
         ]
 
-        neg_err = self.calculate_error(
-            coders=coders, mode="neg", desc="testing for negative sample",
-            org_H=org_H, org_W=org_W, patch_size=patch_size, stride=stride, num_of_ch=num_of_ch
-        )
-        pos_err = self.calculate_error(
-            coders=coders, mode="pos", desc="testing for positive sample",
-            org_H=org_H, org_W=org_W, patch_size=patch_size, stride=stride, num_of_ch=num_of_ch
-        )
+        neg_err = self.calculate_error(coders=coders, is_positive=False)
+        pos_err = self.calculate_error(coders=coders, is_positive=True)
 
         ap, auc = self.calculate_score(neg_err, pos_err)
         print("\nTest set: AP: {:.4f}, AUC: {:.4f}\n".format(ap, auc))
 
-    def calculate_error(self, coders, mode, desc, org_H, org_W, patch_size, stride, num_of_ch):
-        if mode == "neg":
-            loader = self.test_neg_loader
-        elif mode == "pos":
+    def calculate_error(self, coders, is_positive):
+        if is_positive:
             loader = self.test_pos_loader
         else:
-            raise ValueError("The argument 'mode' must be set to 'neg' or 'pos'.")
+            loader = self.test_neg_loader
 
         errs = []
         top_5 = numpy.zeros(len(self.dictionaries))
-        for batch_data in tqdm(loader, desc=desc):
-            batch_name, batch_img = batch_data[0], batch_data[1]
+
+        random.seed(0)
+        dict_order = list(range(896))
+        random.shuffle(dict_order)
+
+        for batch_data in tqdm(loader, desc="testing"):
+
+            batch_path, batch_name, batch_img = batch_data
             p_batch_img = batch_img
             for p in self.preprocesses:
                 p_batch_img = p(p_batch_img)
 
-            for img, img_org in zip(p_batch_img, batch_img):
-                P, C, H, W = img.shape
-                img_arr = img.reshape(P, C, H * W)
-                f_diff = numpy.zeros((1, org_H, org_W))
+            for p_img, org_img in zip(p_batch_img, batch_img):
+
+                P, C, H, W = p_img.shape
+                img_arr = p_img.reshape(P, C, H * W)
+                f_diff = numpy.zeros((1, self.org_l, self.org_l))
 
                 ch_err = []
-                for num in range(num_of_ch):
-                    i = self.dict_order[num]
+                for num in range(self.num_of_ch):
+                    i = dict_order[num]
                     target_arr = img_arr[:, i]
                     coefs = coders[i].transform(target_arr)
                     rcn_arr = coefs.dot(self.dictionaries[i])
 
-                    f_img_org = self.reconst_from_array(
-                        target_arr, org_H, org_W, patch_size, stride
-                    )
-                    f_img_rcn = self.reconst_from_array(
-                        rcn_arr, org_H, org_W, patch_size, stride
-                    )
-                    f_diff += numpy.square((f_img_org - f_img_rcn) / 2)
+                    f_img_org = self.reconst_from_array(target_arr)
+                    f_img_rcn = self.reconst_from_array(rcn_arr)
+                    f_diff += numpy.square((f_img_org - f_img_rcn) / 1.5)
 
                     if not self.use_ssim:
                         err = numpy.sum((target_arr - rcn_arr) ** 2, axis=1)
                     else:
-                        err = [
-                            -1
-                            * compare_ssim(
-                                img_arr[p, c].reshape(H, W),
-                                rcn_arr[p, c].reshape(H, W),
-                                win_size=11,
-                                data_range=1.0,
-                                gaussian_weights=True,
-                            )
-                            for p in range(P)
-                            for c in range(C)
-                        ]
+                        err = self.calc_ssim(img_arr, rcn_arr, (P, C, H, W))
                     sorted_err = numpy.sort(err)[::-1]
                     total_err = numpy.sum(sorted_err[:5])
                     ch_err.append(total_err)
 
                 top_5[numpy.argsort(ch_err)[::-1][:5]] += 1
                 errs.append(numpy.sum(ch_err))
-
-                f_diff /= num_of_ch
-                color_map = plt.get_cmap("viridis")
-                heatmap = numpy.uint8(color_map(f_diff[0])[:, :, :3] * 255)
-
-                transposed = img_org.transpose(1, 2, 0)[:, :, [2, 1, 0]]
-                resized = cv2.resize(
-                    heatmap, (transposed.shape[0], transposed.shape[1])
-                )
-                blended = cv2.addWeighted(
-                    transposed, 1.0, resized, 0.01, 2.2, dtype=cv2.CV_32F
-                )
-                blended_normed = (
-                    255 * (blended - blended.min()) / (blended.max() - blended.min())
-                )
-                blended_out = numpy.array(blended_normed, numpy.int)
-
-                output_path = os.path.join("visualized_results", mode)
-                os.makedirs(output_path, exist_ok=True)
-
-                cv2.imwrite(
-                    os.path.join(
-                        output_path,
-                        batch_name.split(".")[0] + "-" + str(int(numpy.sum(ch_err))) + ".png",
-                    ),
-                    blended_out,
-                )
-
+                f_diff /= self.num_of_ch
+                if self.output_npy:
+                    self.output_np_array(batch_path, batch_name, f_diff)
+                else:
+                    visualized_out = self.visualize(org_img, f_diff)
+                    self.output_image(batch_path, batch_name,
+                                      ch_err, visualized_out)
         return errs
+
+    def output_np_array(self, batch_path, batch_name, f_diff):
+        output_path = os.path.join("visualized_results", batch_path)
+        os.makedirs(output_path, exist_ok=True)
+        numpy.save(os.path.join(
+            output_path, batch_name.split(".")[0] + ".npy"), f_diff)
+
+    def output_image(self, batch_path, batch_name, ch_err, visualized_out):
+        output_path = os.path.join("visualized_results", batch_path)
+        os.makedirs(output_path, exist_ok=True)
+
+        cv2.imwrite(
+            os.path.join(
+                output_path,
+                batch_name.split(".")[0] + "-" +
+                str(int(numpy.sum(ch_err))) + ".png",
+            ),
+            visualized_out,
+        )
+
+    def calculate_ssim(self, img_arr, rcn_arr, dim):
+        P, C, H, W = dim
+        return [
+            -1
+            * structural_similarity(
+                img_arr[p, c].reshape(H, W),
+                rcn_arr[p, c].reshape(H, W),
+                win_size=11,
+                data_range=1.0,
+                gaussian_weights=True,
+            )
+            for p in range(P)
+            for c in range(C)
+        ]
+
+    def visualize(self, org_img, f_diff):
+        color_map = plt.get_cmap("viridis")
+        heatmap = numpy.uint8(color_map(f_diff[0])[:, :, :3] * 255)
+        transposed = org_img.transpose(1, 2, 0)[:, :, [2, 1, 0]]
+        resized = cv2.resize(
+            heatmap, (transposed.shape[0], transposed.shape[1])
+        )
+        blended = cv2.addWeighted(
+            transposed, 1.0, resized, 0.01, 2.2, dtype=cv2.CV_32F
+        )
+        blended_normed = (
+            255 * (blended - blended.min()) /
+            (blended.max() - blended.min())
+        )
+        blended_out = numpy.array(blended_normed, numpy.int)
+        return blended_out
 
     def calculate_score(self, dn, dp):
         N = len(dn)
         y_score = numpy.concatenate([dn, dp])
         y_true = numpy.zeros(len(y_score), dtype=numpy.int32)
         y_true[N:] = 1
-        return average_precision_score(y_true, y_score), roc_auc_score(y_true, y_score)
+        return average_precision_score(y_true, y_score),\
+            roc_auc_score(y_true, y_score)
 
-    def reconst_from_array(self, arrs, org_H, org_W, patch_size, stride):
-        rcn = numpy.zeros((1, org_H, org_W))
+    def reconst_from_array(self, arrs):
+        rcn = numpy.zeros((1, self.org_l, self.org_l))
         arr_iter = iter(arrs)
-        for ty in range(0, org_H - patch_size + 1, stride):
-            for tx in range(0, org_W - patch_size + 1, stride):
+        for ty in range(0, self.org_l - self.patch_size + 1, self.stride):
+            for tx in range(0, self.org_l - self.patch_size + 1, self.stride):
                 arr = next(arr_iter)
-                rcn[:, ty: ty + patch_size, tx: tx + patch_size] = arr.reshape(
-                    1, patch_size, patch_size
+                rcn[:, ty: ty + self.patch_size, tx: tx + self.patch_size] =\
+                    arr.reshape(
+                    1, self.patch_size, self.patch_size
                 )
         return rcn
